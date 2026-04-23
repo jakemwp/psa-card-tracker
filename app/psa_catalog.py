@@ -1,309 +1,297 @@
 """
-PSA Pop Report catalog crawler.
+PSA Pop Report catalog scraper.
 
-Navigates PSA's category hierarchy:
-  /pop/  →  categories  →  years/sets  →  individual card pages
+Uses curl_cffi (Chrome TLS fingerprint) to bypass Cloudflare.
+Card data is loaded via PSA's internal DataTables API:
+  POST https://www.psacard.com/Pop/GetSetItems
 
-Yields card dicts with full population data for bulk import.
+URL hierarchy:
+  /pop/{category-slug}/{cat-id}           → list of year links
+  /pop/{category-slug}/{year}/{year-id}   → list of set links
+  /Pop/GetSetItems  POST                  → card rows for a set
 """
 
 import re
 import time
-import requests
-from bs4 import BeautifulSoup
-from typing import Generator, Optional
+from typing import Generator
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": "https://www.psacard.com/",
-}
+from curl_cffi import requests as cf_requests
+from bs4 import BeautifulSoup
 
 PSA_BASE = "https://www.psacard.com"
-DELAY = 1.5  # seconds between requests
+DELAY = 1.2   # seconds between requests
 
-# Map PSA category URL slugs to friendly sport names
-SPORT_SLUG_MAP = {
+def _new_session() -> cf_requests.Session:
+    s = cf_requests.Session(impersonate="chrome124")
+    s.headers.update({"Referer": PSA_BASE, "Accept-Language": "en-US,en;q=0.9"})
+    return s
+
+# Hardcoded categories with their numeric category IDs (stable, rarely change)
+KNOWN_CATEGORIES = [
+    {"name": "Baseball Cards",                  "slug": "baseball-cards",               "cat_id": "20003"},
+    {"name": "Basketball Cards",                "slug": "basketball-cards",             "cat_id": "20019"},
+    {"name": "Football Cards",                  "slug": "football-cards",               "cat_id": "20014"},
+    {"name": "Hockey Cards",                    "slug": "hockey-cards",                 "cat_id": "20020"},
+    {"name": "Soccer Cards",                    "slug": "soccer-cards",                 "cat_id": "20004"},
+    {"name": "Golf Cards",                      "slug": "golf-cards",                   "cat_id": "20023"},
+    {"name": "Boxing / Wrestling / MMA Cards",  "slug": "boxing-wrestling-cards-mma",   "cat_id": "20021"},
+    {"name": "Non-Sport Cards",                 "slug": "non-sport-cards",              "cat_id": "20032"},
+    {"name": "TCG Cards",                       "slug": "tcg-cards",                    "cat_id": "156940"},
+    {"name": "Multi-Sport Cards",               "slug": "multi-sport-cards",            "cat_id": "20006"},
+    {"name": "Minor League Cards",              "slug": "minor-league-cards",           "cat_id": "20031"},
+    {"name": "Entertainment Cards",             "slug": "entertainment-cards",          "cat_id": "20037"},
+    {"name": "Misc Cards",                      "slug": "misc-cards",                   "cat_id": "20033"},
+]
+
+# Sport label inferred from category
+_SPORT_LABELS = {
     "baseball-cards": "Baseball",
     "basketball-cards": "Basketball",
     "football-cards": "Football",
     "hockey-cards": "Hockey",
     "soccer-cards": "Soccer",
     "golf-cards": "Golf",
-    "boxing-cards": "Boxing",
-    "wrestling-cards": "Wrestling",
-    "non-sports-cards": "Non-Sports",
+    "boxing-wrestling-cards-mma": "Boxing/Wrestling",
+    "non-sport-cards": "Non-Sport",
     "tcg-cards": "TCG",
-    "pokemon-cards": "Pokemon",
-    "magic-cards": "Magic: The Gathering",
-    "yugioh-cards": "Yu-Gi-Oh!",
+    "multi-sport-cards": "Multi-Sport",
+    "minor-league-cards": "Minor League",
     "entertainment-cards": "Entertainment",
-    "auto-cards": "Autographs",
+    "misc-cards": "Misc",
 }
 
 
+def _get(url: str) -> BeautifulSoup:
+    time.sleep(DELAY)
+    resp = cf_requests.get(url, impersonate="chrome124", timeout=20,
+                           headers={"Referer": PSA_BASE, "Accept-Language": "en-US,en;q=0.9"})
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "lxml")
+
+
+def _post_json(url: str, data: dict, referer: str = PSA_BASE) -> dict:
+    time.sleep(DELAY)
+    resp = cf_requests.post(
+        url, data=data, impersonate="chrome124", timeout=20,
+        headers={
+            "Referer": referer,
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 class PSACatalogScraper:
     def __init__(self, delay: float = DELAY):
-        self.delay = delay
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
         self._abort = False
 
     def abort(self):
         self._abort = True
 
-    def _get(self, url: str) -> Optional[BeautifulSoup]:
-        if self._abort:
-            return None
-        try:
-            time.sleep(self.delay)
-            resp = self.session.get(url, timeout=15)
-            resp.raise_for_status()
-            return BeautifulSoup(resp.text, "lxml")
-        except Exception:
-            return None
-
-    # ------------------------------------------------------------------
-    # Top-level category list
-    # ------------------------------------------------------------------
-
     def get_categories(self) -> list[dict]:
-        """
-        Fetch the top-level categories from the PSA pop report home page.
-        Returns list of {name, url, slug}
-        """
-        soup = self._get(f"{PSA_BASE}/pop/")
-        if not soup:
-            return []
+        """Returns hardcoded category list instantly — no network call."""
+        return list(KNOWN_CATEGORIES)
 
-        categories = []
+    def get_years(self, cat: dict) -> list[dict]:
+        """
+        Fetch the category page and return all year entries.
+        Each entry: {label, year_url, year_id, cat_id, sport}
+        """
+        url = f"{PSA_BASE}/pop/{cat['slug']}/{cat['cat_id']}"
+        soup = _get(url)
+        sport = _SPORT_LABELS.get(cat["slug"], cat["name"])
+
+        years = []
         seen = set()
-
-        for a in soup.select("a[href]"):
-            href = a.get("href", "")
-            # Match /pop/{slug}/ or /pop/{slug}
-            m = re.match(r"^/pop/([a-z0-9-]+)/?$", href)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            # Match /pop/{slug}/{year-label}/{year-id}
+            m = re.match(r"^/pop/[^/]+/([^/]+)/(\d+)$", href)
             if not m:
                 continue
-            slug = m.group(1)
-            if slug in seen or slug in ("search", "cert", "verifycert"):
+            year_label = m.group(1)
+            year_id = m.group(2)
+            if year_id in seen:
                 continue
-            seen.add(slug)
-            name = SPORT_SLUG_MAP.get(slug, a.get_text(strip=True)[:60] or slug.replace("-", " ").title())
-            categories.append({
-                "name": name,
-                "slug": slug,
-                "url": PSA_BASE + href if href.startswith("/") else href,
+            seen.add(year_id)
+            label = a.get_text(strip=True) or year_label
+            years.append({
+                "label": label,
+                "year_url": PSA_BASE + href,
+                "year_id": year_id,
+                "cat_id": cat["cat_id"],
+                "sport": sport,
+                "slug": cat["slug"],
             })
 
-        # If PSA didn't expose them as links, return known categories
-        if not categories:
-            categories = [
-                {"name": v, "slug": k, "url": f"{PSA_BASE}/pop/{k}/"}
-                for k, v in SPORT_SLUG_MAP.items()
-            ]
+        # Sort newest first
+        def _sort_key(y):
+            m = re.search(r"\d{4}", y["label"])
+            return int(m.group()) if m else 0
 
-        return categories
+        years.sort(key=_sort_key, reverse=True)
+        return years
 
-    # ------------------------------------------------------------------
-    # Sets within a category
-    # ------------------------------------------------------------------
-
-    def get_sets(self, category_url: str, category_name: str = "") -> list[dict]:
+    def get_sets(self, year: dict) -> list[dict]:
         """
-        Return all sets (leaf pages) reachable from a category URL.
-        PSA organises as: category → year → set
-        Returns list of {name, url, year, sport}
+        Fetch a year page and return all set entries.
+        Each entry: {name, set_url, heading_id, cat_id, year_label, sport}
         """
+        soup = _get(year["year_url"])
+        sport = year.get("sport", "")
+        slug = year.get("slug", "")
+
         sets = []
-        soup = self._get(category_url)
-        if not soup:
-            return sets
-
-        # Collect all /pop/... links that look like set pages (≥4 path segments)
-        for a in soup.select("a[href*='/pop/']"):
-            href = a.get("href", "")
-            parts = [p for p in href.split("/") if p and p != "pop"]
-            if len(parts) < 3:
+        seen = set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            # Match /pop/{slug}/{year-label}/{set-slug}/{heading-id}
+            m = re.match(r"^/pop/[^/]+/[^/]+/([^/]+)/(\d+)$", href)
+            if not m:
                 continue
-            full_url = href if href.startswith("http") else PSA_BASE + href
-
-            year_match = re.search(r"\b(19|20)\d{2}\b", href)
-            year = int(year_match.group()) if year_match else None
-
-            name = a.get_text(" ", strip=True)[:120]
-            if not name:
-                name = parts[-1].replace("-", " ").title()
-
+            heading_id = m.group(2)
+            if heading_id in seen:
+                continue
+            seen.add(heading_id)
+            name = a.get_text(strip=True)[:150] or m.group(1).replace("-", " ").title()
             sets.append({
                 "name": name,
-                "url": full_url,
-                "year": year,
-                "sport": category_name,
+                "set_url": PSA_BASE + href,
+                "heading_id": heading_id,
+                "cat_id": year["cat_id"],
+                "year_label": year["label"],
+                "sport": sport,
             })
 
-        # Deduplicate
-        seen = set()
-        unique = []
-        for s in sets:
-            if s["url"] not in seen:
-                seen.add(s["url"])
-                unique.append(s)
-        return unique
-
-    # ------------------------------------------------------------------
-    # Cards within a set page
-    # ------------------------------------------------------------------
+        return sets
 
     def get_cards_from_set(self, set_info: dict) -> list[dict]:
         """
-        Parse a PSA set pop report page and return all card records.
-        Each record has full population + gem rate.
+        Call PSA's GetSetItems API and return all card records with
+        full grade populations and gem rate.
         """
-        soup = self._get(set_info["url"])
-        if not soup:
+        if self._abort:
             return []
 
+        heading_id = set_info["heading_id"]
+        cat_id = set_info["cat_id"]
+        set_url = set_info.get("set_url", "")
+
+        all_rows = []
+        start = 0
+        page_size = 500
+
+        while not self._abort:
+            try:
+                data = _post_json(
+                    f"{PSA_BASE}/Pop/GetSetItems",
+                    {
+                        "draw": 1,
+                        "start": start,
+                        "length": page_size,
+                        "search": "",
+                        "headingID": heading_id,
+                        "categoryID": cat_id,
+                        "isPSADNA": "false",
+                    },
+                    referer=set_url or PSA_BASE,
+                )
+            except Exception as e:
+                print(f"[PSACatalog] GetSetItems error for {heading_id}: {e}")
+                break
+
+            rows = data.get("data", [])
+            if not rows:
+                break
+            all_rows.extend(rows)
+
+            total = data.get("recordsTotal", 0)
+            start += page_size
+            if start >= total:
+                break
+
+        # Parse each row into a card dict
         cards = []
-        page_title = ""
-        h1 = soup.find("h1")
-        if h1:
-            page_title = h1.get_text(" ", strip=True)
+        sport = set_info.get("sport", "")
+        set_name = set_info.get("name", "")
+        year_label = set_info.get("year_label", "")
 
-        # PSA pop report tables: each row is a card with grade columns
-        # Common structure:
-        #   <table> <tr> <td>Card Name/Number</td> <td>Auth</td> <td>1</td> ... <td>10</td> <td>Total</td> </tr>
-        tables = soup.find_all("table")
-        for table in tables:
-            headers_row = table.find("tr")
-            if not headers_row:
-                continue
-            header_cells = [th.get_text(strip=True).upper() for th in headers_row.find_all(["th", "td"])]
+        # Try to extract numeric year
+        year_match = re.search(r"\b(1[89]\d{2}|20\d{2})\b", year_label)
+        year = int(year_match.group()) if year_match else None
 
-            # Identify grade column positions
-            grade_cols = {}
-            for i, h in enumerate(header_cells):
-                clean = h.replace("PSA", "").replace("GEM", "").strip()
-                if clean == "10":
-                    grade_cols[10] = i
-                elif clean == "9" or "MINT" in h:
-                    grade_cols[9] = i
-                elif clean == "8":
-                    grade_cols[8] = i
-                elif clean == "7":
-                    grade_cols[7] = i
-                elif clean == "6":
-                    grade_cols[6] = i
-                elif clean == "5":
-                    grade_cols[5] = i
-                elif clean == "4":
-                    grade_cols[4] = i
-                elif clean == "3":
-                    grade_cols[3] = i
-                elif clean == "2":
-                    grade_cols[2] = i
-                elif clean == "1" or clean == "PR":
-                    grade_cols[1] = i
-                elif "AUTH" in h:
-                    grade_cols["auth"] = i
-
-            if not grade_cols:
+        for row in all_rows:
+            subject = (row.get("SubjectName") or "").strip()
+            if not subject or subject.upper() == "TOTAL POPULATION":
                 continue
 
-            for row in table.find_all("tr")[1:]:
-                cells = row.find_all(["td", "th"])
-                if not cells:
-                    continue
-                cell_texts = [c.get_text(strip=True) for c in cells]
-                if not any(cell_texts):
-                    continue
+            card_num = (row.get("CardNumber") or "").strip()
+            variety  = (row.get("Variety") or "").strip()
 
-                # First cell is usually card name/number
-                raw_name = cell_texts[0] if cell_texts else ""
-                if not raw_name or raw_name.upper() in ("CARD", "NAME", "DESCRIPTION"):
-                    continue
+            # Build a descriptive card name
+            parts = [year_label, set_name, subject]
+            full_name = " ".join(p for p in parts if p).strip()
 
-                # Parse card number from name like "001 Bulbasaur" or "#001"
-                card_num = ""
-                num_match = re.match(r"^#?(\d+[A-Za-z]?)\s+(.*)", raw_name)
-                if num_match:
-                    card_num = num_match.group(1)
-                    card_name = num_match.group(2).strip()
-                else:
-                    card_name = raw_name
+            pop_10   = int(row.get("Grade10", 0) or 0)
+            pop_9    = int(row.get("Grade9",  0) or 0)
+            pop_8    = int(row.get("Grade8",  0) or 0)
+            pop_7    = int(row.get("Grade7",  0) or 0)
+            pop_6    = int(row.get("Grade6",  0) or 0)
+            pop_5    = int(row.get("Grade5",  0) or 0)
+            pop_4    = int(row.get("Grade4",  0) or 0)
+            pop_3    = int(row.get("Grade3",  0) or 0)
+            pop_2    = int(row.get("Grade2",  0) or 0)
+            pop_1    = int(row.get("Grade1",  0) or 0)
+            pop_auth = int(row.get("GradeN0", 0) or 0)
+            total    = int(row.get("GradeTotal", 0) or 0)
 
-                # Build card name from set page title if it adds context
-                full_name = card_name
-                if set_info.get("year") and str(set_info["year"]) not in full_name:
-                    full_name = f"{set_info['year']} {card_name}" if card_name else page_title
+            if total == 0:
+                total = pop_10 + pop_9 + pop_8 + pop_7 + pop_6 + pop_5 + pop_4 + pop_3 + pop_2 + pop_1
 
-                # Extract grade counts
-                def safe_int(txt: str) -> int:
-                    clean = re.sub(r"[^\d]", "", txt)
-                    return int(clean) if clean else 0
+            gem_rate = round(pop_10 / total * 100, 2) if total > 0 else 0.0
 
-                pops = {}
-                for grade, col in grade_cols.items():
-                    if col < len(cell_texts):
-                        pops[grade] = safe_int(cell_texts[col])
-
-                # Total — last cell or last numeric cell
-                total_col = len(cell_texts) - 1
-                total = safe_int(cell_texts[total_col]) if cell_texts[total_col] else sum(pops.values())
-                if total == 0:
-                    total = sum(v for k, v in pops.items() if isinstance(k, int))
-
-                pop_10 = pops.get(10, 0)
-                gem_rate = round(pop_10 / total * 100, 2) if total > 0 else 0.0
-
-                card = {
-                    "card_name": full_name[:200],
-                    "year": set_info.get("year"),
-                    "sport": set_info.get("sport", ""),
-                    "card_set": set_info.get("name", "")[:200],
-                    "card_number": card_num[:20],
-                    "variation": "",
-                    "player": card_name[:200],
-                    "psa_pop_10": pop_10,
-                    "psa_pop_9": pops.get(9, 0),
-                    "psa_pop_8": pops.get(8, 0),
-                    "psa_pop_7": pops.get(7, 0),
-                    "psa_pop_6": pops.get(6, 0),
-                    "psa_pop_5": pops.get(5, 0),
-                    "psa_pop_4": pops.get(4, 0),
-                    "psa_pop_3": pops.get(3, 0),
-                    "psa_pop_2": pops.get(2, 0),
-                    "psa_pop_1": pops.get(1, 0),
-                    "psa_pop_auth": pops.get("auth", 0),
-                    "psa_total_pop": total,
-                    "gem_rate": gem_rate,
-                    "psa_url": set_info["url"],
-                }
-                cards.append(card)
+            cards.append({
+                "card_name":     full_name[:200],
+                "year":          year,
+                "sport":         sport,
+                "card_set":      set_name[:200],
+                "card_number":   card_num[:20],
+                "variation":     variety[:100],
+                "player":        subject[:200],
+                "psa_pop_10":    pop_10,
+                "psa_pop_9":     pop_9,
+                "psa_pop_8":     pop_8,
+                "psa_pop_7":     pop_7,
+                "psa_pop_6":     pop_6,
+                "psa_pop_5":     pop_5,
+                "psa_pop_4":     pop_4,
+                "psa_pop_3":     pop_3,
+                "psa_pop_2":     pop_2,
+                "psa_pop_1":     pop_1,
+                "psa_pop_auth":  pop_auth,
+                "psa_total_pop": total,
+                "gem_rate":      gem_rate,
+                "psa_url":       set_url,
+            })
 
         return cards
-
-    # ------------------------------------------------------------------
-    # High-level generator: stream all cards from a list of set URLs
-    # ------------------------------------------------------------------
 
     def stream_cards(
         self, sets: list[dict]
     ) -> Generator[tuple[dict, int, int], None, None]:
-        """
-        Yields (card_dict, current_set_index, total_sets) for each card found.
-        """
+        """Yield (card_dict, set_index, total_sets) for every card in the given sets."""
         total = len(sets)
         for i, set_info in enumerate(sets):
             if self._abort:
                 return
-            cards = self.get_cards_from_set(set_info)
-            for card in cards:
+            for card in self.get_cards_from_set(set_info):
                 if self._abort:
                     return
                 yield card, i + 1, total

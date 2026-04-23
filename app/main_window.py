@@ -272,88 +272,119 @@ class CatalogImportWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Browse PSA Catalog dialog
+# Background workers for catalog browsing
+# ---------------------------------------------------------------------------
+
+class _YearLoaderWorker(QThread):
+    done = pyqtSignal(list)   # list of year dicts
+    error = pyqtSignal(str)
+    def __init__(self, cat):
+        super().__init__()
+        self.cat = cat
+    def run(self):
+        try:
+            years = PSACatalogScraper().get_years(self.cat)
+            self.done.emit(years)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class _SetLoaderWorker(QThread):
+    done = pyqtSignal(list)   # list of set dicts
+    error = pyqtSignal(str)
+    def __init__(self, year):
+        super().__init__()
+        self.year = year
+    def run(self):
+        try:
+            sets = PSACatalogScraper().get_sets(self.year)
+            self.done.emit(sets)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Browse PSA Catalog dialog  (3-panel: Category → Year → Sets)
 # ---------------------------------------------------------------------------
 
 class BrowseCatalogDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("Browse & Import PSA Catalog")
-        self.setMinimumSize(700, 520)
-        self._categories: list[dict] = []
+        self.setMinimumSize(860, 560)
+        self._categories: list[dict] = PSACatalogScraper().get_categories()
+        self._years: list[dict] = []
         self._sets: list[dict] = []
-        self._selected_sets: list[dict] = []
         self._worker: Optional[CatalogImportWorker] = None
+        self._year_loader: Optional[_YearLoaderWorker] = None
+        self._set_loader: Optional[_SetLoaderWorker] = None
         self._build_ui()
+        self._populate_categories()
 
     def _build_ui(self):
+        from PyQt6.QtWidgets import QListWidget, QListWidgetItem, QCheckBox
+        self._LW = QListWidgetItem
+
         layout = QVBoxLayout(self)
-
-        info = QLabel(
-            "Load PSA pop report categories, select the sets you want, then click Import.\n"
-            "Gem rates are fetched for every card in the selected sets and saved to your database."
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        # Top row: load categories
-        top_row = QHBoxLayout()
-        self._load_cats_btn = QPushButton("Load PSA Categories")
-        self._load_cats_btn.clicked.connect(self._load_categories)
-        self._cat_status = QLabel("Click 'Load PSA Categories' to start.")
-        top_row.addWidget(self._load_cats_btn)
-        top_row.addWidget(self._cat_status, 1)
-        layout.addLayout(top_row)
+        layout.addWidget(QLabel(
+            "Select a category → select a year → check sets → click Import Selected Sets"
+        ))
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left: category list
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 0, 0)
-        ll.addWidget(QLabel("Categories:"))
-        from PyQt6.QtWidgets import QListWidget, QListWidgetItem
+        # Panel 1: Categories
+        p1 = QWidget(); v1 = QVBoxLayout(p1); v1.setContentsMargins(0,0,0,0)
+        v1.addWidget(QLabel("<b>Category</b>"))
         self._cat_list = QListWidget()
-        self._cat_list.itemSelectionChanged.connect(self._on_category_selected)
-        ll.addWidget(self._cat_list)
-        splitter.addWidget(left)
+        self._cat_list.currentRowChanged.connect(self._on_cat_selected)
+        v1.addWidget(self._cat_list)
+        splitter.addWidget(p1)
 
-        # Right: sets list with checkboxes
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(0, 0, 0, 0)
-        sets_header = QHBoxLayout()
-        sets_header.addWidget(QLabel("Sets (check to include):"))
-        self._check_all_btn = QPushButton("Check All")
-        self._check_all_btn.setMaximumWidth(80)
-        self._check_all_btn.clicked.connect(self._check_all)
-        self._uncheck_all_btn = QPushButton("None")
-        self._uncheck_all_btn.setMaximumWidth(60)
-        self._uncheck_all_btn.clicked.connect(self._uncheck_all)
-        sets_header.addWidget(self._check_all_btn)
-        sets_header.addWidget(self._uncheck_all_btn)
-        rl.addLayout(sets_header)
+        # Panel 2: Years
+        p2 = QWidget(); v2 = QVBoxLayout(p2); v2.setContentsMargins(0,0,0,0)
+        v2.addWidget(QLabel("<b>Year</b>"))
+        self._year_list = QListWidget()
+        self._year_list.currentRowChanged.connect(self._on_year_selected)
+        v2.addWidget(self._year_list)
+        splitter.addWidget(p2)
+
+        # Panel 3: Sets with checkboxes
+        p3 = QWidget(); v3 = QVBoxLayout(p3); v3.setContentsMargins(0,0,0,0)
+        hdr = QHBoxLayout()
+        hdr.addWidget(QLabel("<b>Sets</b>"))
+        self._chk_all_btn = QPushButton("✓ All")
+        self._chk_all_btn.setMaximumWidth(55)
+        self._chk_all_btn.clicked.connect(self._check_all)
+        self._unchk_btn = QPushButton("✗ None")
+        self._unchk_btn.setMaximumWidth(60)
+        self._unchk_btn.clicked.connect(self._uncheck_all)
+        hdr.addWidget(self._chk_all_btn)
+        hdr.addWidget(self._unchk_btn)
+        v3.addLayout(hdr)
         self._set_list = QListWidget()
-        rl.addWidget(self._set_list)
-        splitter.addWidget(right)
-        splitter.setSizes([200, 480])
+        v3.addWidget(self._set_list)
+        splitter.addWidget(p3)
+
+        splitter.setSizes([160, 140, 400])
         layout.addWidget(splitter, 1)
 
+        # Status bar
+        self._status = QLabel("Select a category to begin.")
+        layout.addWidget(self._status)
+
         # eBay toggle
-        from PyQt6.QtWidgets import QCheckBox
-        self._ebay_check = QCheckBox("Also fetch eBay sold prices for new cards (much slower)")
+        self._ebay_check = QCheckBox(
+            "Also fetch eBay sold prices for new cards (much slower)"
+        )
         layout.addWidget(self._ebay_check)
 
         # Progress
         self._progress_bar = QProgressBar()
         self._progress_bar.setVisible(False)
-        self._progress_label = QLabel("")
         layout.addWidget(self._progress_bar)
-        layout.addWidget(self._progress_label)
 
         # Buttons
         btn_row = QHBoxLayout()
-        self._import_btn = QPushButton("Import Selected Sets")
+        self._import_btn = QPushButton("⬇  Import Selected Sets")
         self._import_btn.setEnabled(False)
         self._import_btn.clicked.connect(self._start_import)
         self._stop_btn = QPushButton("Stop")
@@ -367,46 +398,72 @@ class BrowseCatalogDialog(QDialog):
         btn_row.addWidget(self._close_btn)
         layout.addLayout(btn_row)
 
-        self._QListWidgetItem = QListWidgetItem  # keep ref
-
-    def _load_categories(self):
-        self._load_cats_btn.setEnabled(False)
-        self._cat_status.setText("Loading from PSA…")
-        QTimer.singleShot(50, self._do_load_categories)
-
-    def _do_load_categories(self):
-        scraper = PSACatalogScraper()
-        self._categories = scraper.get_categories()
+    def _populate_categories(self):
         self._cat_list.clear()
         for cat in self._categories:
             self._cat_list.addItem(cat["name"])
-        count = len(self._categories)
-        self._cat_status.setText(f"Loaded {count} categories. Select one to see its sets.")
-        self._load_cats_btn.setEnabled(True)
+        self._status.setText(f"{len(self._categories)} categories. Click one to load years.")
 
-    def _on_category_selected(self):
-        row = self._cat_list.currentRow()
+    # --- Category selected → load years in background ---
+    def _on_cat_selected(self, row: int):
         if row < 0 or row >= len(self._categories):
             return
         cat = self._categories[row]
-        self._cat_status.setText(f"Loading sets for {cat['name']}…")
+        self._year_list.clear()
         self._set_list.clear()
-        QTimer.singleShot(50, lambda: self._do_load_sets(cat))
+        self._years = []
+        self._sets = []
+        self._import_btn.setEnabled(False)
+        self._status.setText(f"Loading years for {cat['name']}…")
 
-    def _do_load_sets(self, cat: dict):
-        scraper = PSACatalogScraper()
-        sets = scraper.get_sets(cat["url"], cat["name"])
+        if self._year_loader and self._year_loader.isRunning():
+            self._year_loader.terminate()
+
+        self._year_loader = _YearLoaderWorker(cat)
+        self._year_loader.done.connect(self._on_years_loaded)
+        self._year_loader.error.connect(lambda e: self._status.setText(f"Error: {e}"))
+        self._year_loader.finished.connect(self._year_loader.deleteLater)
+        self._year_loader.start()
+
+    def _on_years_loaded(self, years: list):
+        self._years = years
+        self._year_list.clear()
+        for y in years:
+            self._year_list.addItem(y["label"])
+        self._status.setText(f"{len(years)} years found. Click a year to see sets.")
+
+    # --- Year selected → load sets in background ---
+    def _on_year_selected(self, row: int):
+        if row < 0 or row >= len(self._years):
+            return
+        year = self._years[row]
+        self._set_list.clear()
+        self._sets = []
+        self._import_btn.setEnabled(False)
+        self._status.setText(f"Loading sets for {year['label']}…")
+
+        if self._set_loader and self._set_loader.isRunning():
+            self._set_loader.terminate()
+
+        self._set_loader = _SetLoaderWorker(year)
+        self._set_loader.done.connect(self._on_sets_loaded)
+        self._set_loader.error.connect(lambda e: self._status.setText(f"Error: {e}"))
+        self._set_loader.finished.connect(self._set_loader.deleteLater)
+        self._set_loader.start()
+
+    def _on_sets_loaded(self, sets: list):
         self._sets = sets
         self._set_list.clear()
         for s in sets:
-            item = self._QListWidgetItem(
-                f"{s.get('year', '')}  {s['name']}"[:100]
-            )
+            item = self._LW(s["name"])
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
             self._set_list.addItem(item)
-        self._cat_status.setText(f"{len(sets)} sets found. Check the ones you want to import.")
-        self._import_btn.setEnabled(True)
+        n = len(sets)
+        self._status.setText(
+            f"{n} set{'s' if n != 1 else ''} found. Check any you want, then click Import."
+        )
+        self._import_btn.setEnabled(n > 0)
 
     def _check_all(self):
         for i in range(self._set_list.count()):
@@ -417,42 +474,42 @@ class BrowseCatalogDialog(QDialog):
             self._set_list.item(i).setCheckState(Qt.CheckState.Unchecked)
 
     def _get_checked_sets(self) -> list[dict]:
-        checked = []
-        for i in range(self._set_list.count()):
-            if self._set_list.item(i).checkState() == Qt.CheckState.Checked:
-                if i < len(self._sets):
-                    checked.append(self._sets[i])
-        return checked
+        return [
+            self._sets[i]
+            for i in range(self._set_list.count())
+            if i < len(self._sets)
+            and self._set_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
 
     def _start_import(self):
         sets = self._get_checked_sets()
         if not sets:
-            QMessageBox.information(self, "Nothing Selected", "Check at least one set to import.")
+            QMessageBox.information(self, "Nothing checked",
+                                    "Tick at least one set checkbox first.")
             return
 
-        fetch_ebay = self._ebay_check.isChecked()
-        self._worker = CatalogImportWorker(sets, fetch_ebay)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_finished)
+        self._worker = CatalogImportWorker(sets, self._ebay_check.isChecked())
+        self._worker.progress.connect(self._on_import_progress)
+        self._worker.finished.connect(self._on_import_finished)
         self._worker.finished.connect(self._worker.deleteLater)
 
-        self._progress_bar.setVisible(True)
         self._progress_bar.setRange(0, len(sets))
         self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(True)
         self._import_btn.setEnabled(False)
         self._stop_btn.setVisible(True)
         self._worker.start()
 
-    def _on_progress(self, msg: str, imported: int, total_sets: int):
-        self._progress_bar.setRange(0, total_sets)
+    def _on_import_progress(self, msg: str, imported: int, total_sets: int):
+        self._progress_bar.setRange(0, max(total_sets, 1))
         self._progress_bar.setValue(imported)
-        self._progress_label.setText(msg)
+        self._status.setText(msg)
 
-    def _on_finished(self, total: int, new: int):
+    def _on_import_finished(self, total: int, new: int):
         self._progress_bar.setVisible(False)
         self._stop_btn.setVisible(False)
         self._import_btn.setEnabled(True)
-        self._progress_label.setText(
+        self._status.setText(
             f"Done — {total} cards processed, {new} new cards added to database."
         )
 
@@ -462,9 +519,11 @@ class BrowseCatalogDialog(QDialog):
         self._stop_btn.setVisible(False)
 
     def closeEvent(self, event):
-        if self._worker and self._worker.isRunning():
-            self._worker.abort()
-            self._worker.wait(3000)
+        for w in (self._worker, self._year_loader, self._set_loader):
+            if w and w.isRunning():
+                if hasattr(w, "abort"):
+                    w.abort()
+                w.wait(2000)
         event.accept()
 
 
@@ -1182,4 +1241,7 @@ class MainWindow(QMainWindow):
                 w.abort()
             if w.isRunning():
                 w.wait(2000)
+        # Shut down the shared headless browser
+        from . import browser as _browser
+        _browser.quit()
         event.accept()
