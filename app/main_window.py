@@ -86,6 +86,19 @@ class CardTableModel(QAbstractTableModel):
                 return val[:10]
             return str(val)
 
+        # Return raw numeric value for sort role so Qt sorts numerically not alphabetically
+        if role == Qt.ItemDataRole.UserRole:
+            if val is None:
+                return -1
+            if field in ("gem_rate", "ebay_avg_price", "ebay_low_price",
+                         "ebay_high_price", "psa_pop_10", "psa_total_pop",
+                         "ebay_sold_count", "year", "id"):
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    return -1.0
+            return str(val).lower()
+
         if role == Qt.ItemDataRole.BackgroundRole:
             if field == "gem_rate" and val is not None:
                 if val >= 80:
@@ -1008,8 +1021,12 @@ class MainWindow(QMainWindow):
 
         # --- Card table ---
         self._model = CardTableModel()
+        self._proxy = QSortFilterProxyModel()
+        self._proxy.setSourceModel(self._model)
+        self._proxy.setSortRole(Qt.ItemDataRole.UserRole)
+        self._proxy.setSortCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self._table = QTableView()
-        self._table.setModel(self._model)
+        self._table.setModel(self._proxy)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
@@ -1049,8 +1066,12 @@ class MainWindow(QMainWindow):
     def _on_filter_changed(self, filters: dict):
         self._refresh_table(filters)
 
+    def _source_row(self, proxy_index: QModelIndex) -> int:
+        """Map a proxy model index back to the source model row."""
+        return self._proxy.mapToSource(proxy_index).row()
+
     def _on_row_selected(self, current: QModelIndex, _previous: QModelIndex):
-        row = current.row()
+        row = self._source_row(current)
         card_id = self._model.get_card_id(row)
         card = self._model.get_row_data(row)
         if card_id and card:
@@ -1067,7 +1088,7 @@ class MainWindow(QMainWindow):
             self._scrape_card(card_id)
 
     def _edit_card(self, index: QModelIndex):
-        card_id = self._model.get_card_id(index.row())
+        card_id = self._model.get_card_id(self._source_row(index))
         card = db.get_card(card_id)
         if not card:
             return
@@ -1096,8 +1117,9 @@ class MainWindow(QMainWindow):
         index = self._table.indexAt(pos)
         if not index.isValid():
             return
-        card_id = self._model.get_card_id(index.row())
-        card = self._model.get_row_data(index.row())
+        src_row = self._source_row(index)
+        card_id = self._model.get_card_id(src_row)
+        card = self._model.get_row_data(src_row)
         if not card_id:
             return
 
@@ -1122,7 +1144,7 @@ class MainWindow(QMainWindow):
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
     def _refresh_selected(self):
-        rows = set(idx.row() for idx in self._table.selectedIndexes())
+        rows = set(self._source_row(idx) for idx in self._table.selectedIndexes())
         ids = [self._model.get_card_id(r) for r in rows if self._model.get_card_id(r)]
         if not ids:
             self._status.showMessage("No cards selected.", 2000)
