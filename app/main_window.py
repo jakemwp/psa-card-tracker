@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 from . import database as db
 from .psa_scraper import PSAScraper
 from .ebay_scraper import EbayScraper
+from .psa_catalog import PSACatalogScraper
 
 SPORTS = ["", "Baseball", "Basketball", "Football", "Hockey", "Soccer",
           "Pokemon", "Magic: The Gathering", "Yu-Gi-Oh!", "Other TCG", "Other"]
@@ -216,6 +217,255 @@ class BulkScrapeWorker(QThread):
             self.card_done.emit(cid)
 
         self.finished.emit()
+
+
+# ---------------------------------------------------------------------------
+# Catalog import worker
+# ---------------------------------------------------------------------------
+
+class CatalogImportWorker(QThread):
+    progress = pyqtSignal(str, int, int)   # message, imported, total_sets
+    card_imported = pyqtSignal(str, bool)  # card_name, was_new
+    finished = pyqtSignal(int, int)        # total_imported, total_new
+
+    def __init__(self, sets: list[dict], fetch_ebay: bool = False):
+        super().__init__()
+        self.sets = sets
+        self.fetch_ebay = fetch_ebay
+        self._abort = False
+        self._scraper = PSACatalogScraper()
+
+    def abort(self):
+        self._abort = True
+        self._scraper.abort()
+
+    def run(self):
+        ebay = EbayScraper() if self.fetch_ebay else None
+        total_imported = 0
+        total_new = 0
+
+        for card, set_idx, total_sets in self._scraper.stream_cards(self.sets):
+            if self._abort:
+                break
+
+            card_id, was_new = db.upsert_card(card)
+            total_imported += 1
+            if was_new:
+                total_new += 1
+
+            if self.fetch_ebay and ebay and was_new:
+                query = _build_ebay_query(card)
+                listings = ebay.search_sold(query)
+                if listings:
+                    summary = ebay.summarize(listings)
+                    db.update_card(card_id, summary)
+                    db.save_ebay_listings(card_id, listings)
+
+            self.progress.emit(
+                f"Set {set_idx}/{total_sets} — {card.get('card_name', '')}",
+                total_imported,
+                total_sets,
+            )
+            self.card_imported.emit(card.get("card_name", ""), was_new)
+
+        self.finished.emit(total_imported, total_new)
+
+
+# ---------------------------------------------------------------------------
+# Browse PSA Catalog dialog
+# ---------------------------------------------------------------------------
+
+class BrowseCatalogDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Browse & Import PSA Catalog")
+        self.setMinimumSize(700, 520)
+        self._categories: list[dict] = []
+        self._sets: list[dict] = []
+        self._selected_sets: list[dict] = []
+        self._worker: Optional[CatalogImportWorker] = None
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "Load PSA pop report categories, select the sets you want, then click Import.\n"
+            "Gem rates are fetched for every card in the selected sets and saved to your database."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Top row: load categories
+        top_row = QHBoxLayout()
+        self._load_cats_btn = QPushButton("Load PSA Categories")
+        self._load_cats_btn.clicked.connect(self._load_categories)
+        self._cat_status = QLabel("Click 'Load PSA Categories' to start.")
+        top_row.addWidget(self._load_cats_btn)
+        top_row.addWidget(self._cat_status, 1)
+        layout.addLayout(top_row)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: category list
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.addWidget(QLabel("Categories:"))
+        from PyQt6.QtWidgets import QListWidget, QListWidgetItem
+        self._cat_list = QListWidget()
+        self._cat_list.itemSelectionChanged.connect(self._on_category_selected)
+        ll.addWidget(self._cat_list)
+        splitter.addWidget(left)
+
+        # Right: sets list with checkboxes
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        sets_header = QHBoxLayout()
+        sets_header.addWidget(QLabel("Sets (check to include):"))
+        self._check_all_btn = QPushButton("Check All")
+        self._check_all_btn.setMaximumWidth(80)
+        self._check_all_btn.clicked.connect(self._check_all)
+        self._uncheck_all_btn = QPushButton("None")
+        self._uncheck_all_btn.setMaximumWidth(60)
+        self._uncheck_all_btn.clicked.connect(self._uncheck_all)
+        sets_header.addWidget(self._check_all_btn)
+        sets_header.addWidget(self._uncheck_all_btn)
+        rl.addLayout(sets_header)
+        self._set_list = QListWidget()
+        rl.addWidget(self._set_list)
+        splitter.addWidget(right)
+        splitter.setSizes([200, 480])
+        layout.addWidget(splitter, 1)
+
+        # eBay toggle
+        from PyQt6.QtWidgets import QCheckBox
+        self._ebay_check = QCheckBox("Also fetch eBay sold prices for new cards (much slower)")
+        layout.addWidget(self._ebay_check)
+
+        # Progress
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setVisible(False)
+        self._progress_label = QLabel("")
+        layout.addWidget(self._progress_bar)
+        layout.addWidget(self._progress_label)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self._import_btn = QPushButton("Import Selected Sets")
+        self._import_btn.setEnabled(False)
+        self._import_btn.clicked.connect(self._start_import)
+        self._stop_btn = QPushButton("Stop")
+        self._stop_btn.setVisible(False)
+        self._stop_btn.clicked.connect(self._stop_import)
+        self._close_btn = QPushButton("Close")
+        self._close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self._import_btn)
+        btn_row.addWidget(self._stop_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self._close_btn)
+        layout.addLayout(btn_row)
+
+        self._QListWidgetItem = QListWidgetItem  # keep ref
+
+    def _load_categories(self):
+        self._load_cats_btn.setEnabled(False)
+        self._cat_status.setText("Loading from PSA…")
+        QTimer.singleShot(50, self._do_load_categories)
+
+    def _do_load_categories(self):
+        scraper = PSACatalogScraper()
+        self._categories = scraper.get_categories()
+        self._cat_list.clear()
+        for cat in self._categories:
+            self._cat_list.addItem(cat["name"])
+        count = len(self._categories)
+        self._cat_status.setText(f"Loaded {count} categories. Select one to see its sets.")
+        self._load_cats_btn.setEnabled(True)
+
+    def _on_category_selected(self):
+        row = self._cat_list.currentRow()
+        if row < 0 or row >= len(self._categories):
+            return
+        cat = self._categories[row]
+        self._cat_status.setText(f"Loading sets for {cat['name']}…")
+        self._set_list.clear()
+        QTimer.singleShot(50, lambda: self._do_load_sets(cat))
+
+    def _do_load_sets(self, cat: dict):
+        scraper = PSACatalogScraper()
+        sets = scraper.get_sets(cat["url"], cat["name"])
+        self._sets = sets
+        self._set_list.clear()
+        for s in sets:
+            item = self._QListWidgetItem(
+                f"{s.get('year', '')}  {s['name']}"[:100]
+            )
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self._set_list.addItem(item)
+        self._cat_status.setText(f"{len(sets)} sets found. Check the ones you want to import.")
+        self._import_btn.setEnabled(True)
+
+    def _check_all(self):
+        for i in range(self._set_list.count()):
+            self._set_list.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def _uncheck_all(self):
+        for i in range(self._set_list.count()):
+            self._set_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+    def _get_checked_sets(self) -> list[dict]:
+        checked = []
+        for i in range(self._set_list.count()):
+            if self._set_list.item(i).checkState() == Qt.CheckState.Checked:
+                if i < len(self._sets):
+                    checked.append(self._sets[i])
+        return checked
+
+    def _start_import(self):
+        sets = self._get_checked_sets()
+        if not sets:
+            QMessageBox.information(self, "Nothing Selected", "Check at least one set to import.")
+            return
+
+        fetch_ebay = self._ebay_check.isChecked()
+        self._worker = CatalogImportWorker(sets, fetch_ebay)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.finished.connect(self._worker.deleteLater)
+
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setRange(0, len(sets))
+        self._progress_bar.setValue(0)
+        self._import_btn.setEnabled(False)
+        self._stop_btn.setVisible(True)
+        self._worker.start()
+
+    def _on_progress(self, msg: str, imported: int, total_sets: int):
+        self._progress_bar.setRange(0, total_sets)
+        self._progress_bar.setValue(imported)
+        self._progress_label.setText(msg)
+
+    def _on_finished(self, total: int, new: int):
+        self._progress_bar.setVisible(False)
+        self._stop_btn.setVisible(False)
+        self._import_btn.setEnabled(True)
+        self._progress_label.setText(
+            f"Done — {total} cards processed, {new} new cards added to database."
+        )
+
+    def _stop_import(self):
+        if self._worker:
+            self._worker.abort()
+        self._stop_btn.setVisible(False)
+
+    def closeEvent(self, event):
+        if self._worker and self._worker.isRunning():
+            self._worker.abort()
+            self._worker.wait(3000)
+        event.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +885,9 @@ class MainWindow(QMainWindow):
         self.resize(1400, 800)
         self._workers: list[QThread] = []
         self._active_scrapes: int = 0
+        self._catalog_worker: Optional[CatalogImportWorker] = None
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.timeout.connect(self._refresh_all)
         self._build_ui()
         self._refresh_table()
 
@@ -648,6 +901,10 @@ class MainWindow(QMainWindow):
         act_add.setShortcut("Ctrl+N")
         act_add.triggered.connect(self._add_card)
 
+        act_browse = QAction("🌐  Browse PSA Catalog", self)
+        act_browse.setShortcut("Ctrl+B")
+        act_browse.triggered.connect(self._browse_catalog)
+
         act_refresh_sel = QAction("🔄  Refresh Selected", self)
         act_refresh_sel.setShortcut("F5")
         act_refresh_sel.triggered.connect(self._refresh_selected)
@@ -659,7 +916,10 @@ class MainWindow(QMainWindow):
         act_export = QAction("📊  Export CSV", self)
         act_export.triggered.connect(self._export_csv)
 
-        for act in (act_add, act_refresh_sel, act_refresh_all, act_export):
+        act_auto = QAction("⏰  Auto-Refresh", self)
+        act_auto.triggered.connect(self._configure_auto_refresh)
+
+        for act in (act_add, act_browse, act_refresh_sel, act_refresh_all, act_export, act_auto):
             tb.addAction(act)
 
         # Progress bar in toolbar
@@ -863,6 +1123,42 @@ class MainWindow(QMainWindow):
         self._progress.setVisible(False)
         self._progress_label.setText("")
         self._status.showMessage("All cards refreshed.", 3000)
+
+    def _browse_catalog(self):
+        dlg = BrowseCatalogDialog(self)
+        dlg.exec()
+        # Refresh table after catalog import may have added cards
+        self._refresh_table()
+
+    def _configure_auto_refresh(self):
+        from PyQt6.QtWidgets import QInputDialog
+        intervals = ["Off", "Every 1 hour", "Every 6 hours", "Every 12 hours", "Every 24 hours"]
+        interval_ms = {"Off": 0, "Every 1 hour": 3_600_000, "Every 6 hours": 21_600_000,
+                       "Every 12 hours": 43_200_000, "Every 24 hours": 86_400_000}
+        current = "Off" if not self._auto_refresh_timer.isActive() else "Active"
+        choice, ok = QInputDialog.getItem(
+            self, "Auto-Refresh", "Automatically re-fetch gem rates and eBay prices:", intervals, 0, False
+        )
+        if not ok:
+            return
+        ms = interval_ms.get(choice, 0)
+        if ms == 0:
+            self._auto_refresh_timer.stop()
+            self._status.showMessage("Auto-refresh disabled.", 3000)
+        else:
+            self._auto_refresh_timer.start(ms)
+            self._status.showMessage(f"Auto-refresh set: {choice}", 3000)
+
+    def _on_catalog_progress(self, msg: str, imported: int, total_sets: int):
+        self._progress.setRange(0, total_sets)
+        self._progress.setValue(imported)
+        self._progress_label.setText(f"  {msg}")
+
+    def _on_catalog_finished(self, total: int, new: int):
+        self._progress.setVisible(False)
+        self._progress_label.setText("")
+        self._refresh_table()
+        self._status.showMessage(f"Catalog import done — {total} cards processed, {new} new.", 5000)
 
     def _export_csv(self):
         from PyQt6.QtWidgets import QFileDialog

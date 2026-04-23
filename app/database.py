@@ -175,6 +175,54 @@ def get_card(card_id: int) -> Optional[dict]:
         return dict(row) if row else None
 
 
+def upsert_card(data: dict) -> tuple[int, bool]:
+    """
+    Insert a card if it doesn't exist (matched on card_name + year + card_set + card_number),
+    otherwise update PSA population fields only.
+    Returns (card_id, was_inserted).
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT id FROM cards
+               WHERE card_name = ?
+                 AND COALESCE(year,'') = COALESCE(?,'')
+                 AND COALESCE(card_set,'') = COALESCE(?,'')
+                 AND COALESCE(card_number,'') = COALESCE(?,'')
+               LIMIT 1""",
+            (data.get("card_name"), data.get("year"),
+             data.get("card_set"), data.get("card_number")),
+        ).fetchone()
+
+        psa_fields = [
+            "psa_pop_10","psa_pop_9","psa_pop_8","psa_pop_7","psa_pop_6",
+            "psa_pop_5","psa_pop_4","psa_pop_3","psa_pop_2","psa_pop_1",
+            "psa_pop_auth","psa_total_pop","gem_rate","psa_url",
+        ]
+
+        if row:
+            card_id = row["id"]
+            update = {k: data[k] for k in psa_fields if k in data}
+            update["last_updated"] = now
+            sets = ", ".join(f"{k} = ?" for k in update)
+            conn.execute(f"UPDATE cards SET {sets} WHERE id = ?", [*update.values(), card_id])
+            return card_id, False
+        else:
+            data.setdefault("date_added", now)
+            data["last_updated"] = now
+            cols = ", ".join(data.keys())
+            placeholders = ", ".join(["?"] * len(data))
+            cur = conn.execute(
+                f"INSERT INTO cards ({cols}) VALUES ({placeholders})", list(data.values())
+            )
+            return cur.lastrowid, True
+
+
+def count_cards() -> int:
+    with _connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
+
+
 def get_distinct_values(field: str) -> list:
     safe_fields = {"sport", "card_set", "variation", "year", "player"}
     if field not in safe_fields:
